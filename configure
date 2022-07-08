@@ -1,0 +1,587 @@
+# By C. Weaver
+
+#!/bin/sh
+
+check_pkgconfig(){
+	if [ "$CHECKED_PKGCONFIG" ]; then return; fi
+	echo "Looking for pkg-config..."
+	which pkg-config 2>&1 > /dev/null
+	if [ "$?" -ne 0 ]; then
+		echo "Error: pkg-config not found; you will need to specify library locations manually" 1>&2
+		exit 1
+	fi
+	CHECKED_PKGCONFIG=1
+}
+
+find_package(){
+	PKG=$1
+	VAR_PREFIX=`echo $PKG | tr [:lower:] [:upper:]`
+	TMP_FOUND=`eval echo "$"${VAR_PREFIX}_FOUND`
+	if [ "$TMP_FOUND" ]; then return; fi
+	check_pkgconfig
+	echo "Looking for $PKG..."
+
+	pkg-config --exists $PKG
+	if [ "$?" -ne 0 ]; then
+		echo " $PKG not found with pkg-config"
+		return
+	fi
+	if [ $# -ge 2 ]; then
+		MIN_VERSION=$2
+		pkg-config --atleast-version $MIN_VERSION $PKG
+		if [ "$?" -ne 0 ]; then
+			echo "Error: installed $PKG version ("`pkg-config --modversion $PKG`") is too old; version >=$MIN_VERSION is required" 1>&2
+			exit 1
+		fi
+	fi
+	echo " Found $PKG version `pkg-config --modversion $PKG`"
+	eval ${VAR_PREFIX}_FOUND=1
+	eval ${VAR_PREFIX}_VERSION=\"`pkg-config --modversion $PKG`\"
+	eval ${VAR_PREFIX}_CFLAGS=\"`pkg-config --cflags $PKG`\"
+	eval ${VAR_PREFIX}_LDFLAGS=\"`pkg-config --libs $PKG`\"
+	eval ${VAR_PREFIX}_INCDIR=\"`pkg-config --variable=includedir $PKG`\"
+	eval ${VAR_PREFIX}_LIBDIR=\"`pkg-config --variable=libdir $PKG`\"
+}
+
+find_hdf5(){
+	PKG=hdf5
+	echo "Looking for $PKG..."
+	VAR_PREFIX=`echo $PKG | tr [:lower:] [:upper:]`
+	TMP_FOUND=`eval echo "$"${VAR_PREFIX}_FOUND`
+	if [ "$TMP_FOUND" ]; then return; fi
+
+	which h5cc 2>&1 > /dev/null
+	if [ "$?" -ne 0 ]; then return; fi
+
+	which h5ls 2>&1 > /dev/null
+	if [ "$?" -eq 0 ]; then
+		HDF5_VERSION=`h5ls --version | sed 's/.* \([0-9.]*\)/\1/'`
+		echo " Found $PKG version $HDF5_VERSION via executables in \$PATH"
+		if [ $# -ge 1 ]; then
+			MIN_VERSION=$1
+			#TODO: actually check version
+		fi
+	else
+		echo " h5ls not found; cannot check $PKG version"
+		echo " Proceeding with unknown version and hoping for the best"
+	fi
+	HDF5_COMPILE_COMMAND=`h5cc -show`
+	for item in $HDF5_COMPILE_COMMAND; do
+		item=`echo "$item" | sed 's| |\n|g' | sed -n 's/.*-L\([^ ]*\).*/\1/p'`
+		if [ -n "$item" ]; then
+			POSSIBLE_HDF5_LIBDIRS="$POSSIBLE_HDF5_LIBDIRS
+				$item"
+		fi
+	done
+	for HDF5_LIBDIR in $POSSIBLE_HDF5_LIBDIRS; do
+		if [ -d $HDF5_LIBDIR -a \( -e $HDF5_LIBDIR/libhdf5.a -o -e $HDF5_LIBDIR/libhdf5.so \) ]; then
+			break
+		fi
+	done
+	if [ ! -d $HDF5_LIBDIR -o ! \( -e $HDF5_LIBDIR/libhdf5.a -o -e $HDF5_LIBDIR/libhdf5.so \) ]; then
+		echo " Unable to guess $PKG library directory"
+		return
+	fi
+	POSSIBLE_HDF5_INCDIRS=`echo "$HDF5_COMPILE_COMMAND" | sed 's| |\n|g' | sed -n 's/.*-I\([^ ]*\).*/\1/p'`
+	POSSIBLE_HDF5_INCDIRS="$POSSIBLE_HDF5_INCDIRS ${HDF5_LIBDIR}/../include"
+	for HDF5_INCDIR in $POSSIBLE_HDF5_INCDIRS; do
+		if [ -d $HDF5_INCDIR -a -e $HDF5_INCDIR/H5version.h ]; then
+			break
+		fi
+	done
+	if [ ! -d $HDF5_INCDIR -o ! $HDF5_INCDIR/H5version.h ]; then
+		echo " Unable to guess $PKG include directory"
+		return
+	fi
+
+	HDF5_CFLAGS="-I${HDF5_INCDIR}"
+	HDF5_LDFLAGS=`echo "$HDF5_COMPILE_COMMAND" | \
+	sed 's/ /\\
+	/g' | \
+	sed -n -E \
+	-e '/^[[:space:]]*-l/p' \
+	-e '/^[[:space:]]*-L/p' \
+	-e '/^[[:space:]]*-Wl,/p' \
+	-e 's/^[[:space:]]*.*lib([^.]*)\.a/-l\1/p' \
+	-e 's/^[[:space:]]*.*lib([^.]*)\.so/-l\1/p' \
+	-e 's/^[[:space:]]*.*lib([^.]*)\.dylib/-l\1/p' `
+	HDF5_LDFLAGS=`echo $HDF5_LDFLAGS` # collapse to single line
+
+	HDF5_FOUND=1
+}
+
+PHOTOSPLINE_CONFIG="photospline-config"
+try_find_photospline(){
+	which "$PHOTOSPLINE_CONFIG" 2>&1 > /dev/null
+	if [ "$?" -ne 0 ]; then return; fi
+
+	PHOTOSPLINE_VERSION=`$PHOTOSPLINE_CONFIG --version`
+	PHOTOSPLINE_CFLAGS=`$PHOTOSPLINE_CONFIG --cflags`
+	PHOTOSPLINE_LDFLAGS=`$PHOTOSPLINE_CONFIG --libs`
+	PHOTOSPLINE_FOUND=1
+}
+
+# less searching for python than verfying that the given executable works and extracting relevant paths
+try_find_python(){
+	echo "Looking for python"
+
+	if which ${PYTHON_EXE} > /dev/null 2>&1; then
+		PYTHON_EXE=$(which ${PYTHON_EXE} 2>/dev/null)
+		echo " Using python executable ${PYTHON_EXE}"
+	else
+		echo " ${PYTHON_EXE} is not a valid python executable"
+		return
+	fi
+
+	PYTHON_VERSION=`${PYTHON_EXE} -c 'import sys; print(str(sys.version_info.major)+"."+str(sys.version_info.minor))'`
+	if [ "$?" -ne 0 ]; then
+		echo "Unable to use python executable ${PYTHON_EXE} (version check failed)"
+		return
+	fi
+	PYTHONVERSIONSIMPLE=`${PYTHON_EXE} -c 'import sys; print(str(sys.version_info.major)+str(sys.version_info.minor))'`
+	
+	PYTHON_INCDIR=`${PYTHON_EXE} -c 'from distutils import sysconfig; print(sysconfig.get_python_inc())'`
+	if [ -d "$PYTHON_INCDIR" ]; then
+		echo " Found python include dir $PYTHON_INCDIR"
+	else
+		echo " Unable to locate the python include dir"
+		return
+	fi
+
+	# This is the directory to which libraries should be installed for python to find them
+	PYTHON_MODULEDIR=`${PYTHON_EXE} -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib(plat_specific=True, standard_lib=False))'`
+	if [ "$PYTHON_MODULEDIR" ]; then
+		echo " Python module install dir is $PYTHON_MODULEDIR"
+	else
+		echo " Unable to locate the python module dir"
+		return
+	fi
+	
+	# This is the directory that python claims contains its standard library, 
+	# which may or may not include the actual libpython
+	PYTHON_STDLIBDIR=`${PYTHON_EXE} -c 'from distutils import sysconfig; print(sysconfig.get_python_lib(plat_specific=True,standard_lib=True))'`
+	# This may contain a suffix which appears after the version like in 'libpython3.6m'
+	# See https://www.python.org/dev/peps/pep-3149/#proposal
+	PYTHONLIBSUFFIX=`${PYTHON_EXE} -c 'from distutils import sysconfig; print(sysconfig.build_flags)' 2>/dev/null`
+
+	# Here we just try to guess every location anyone has ever seen a libpython in the wild
+	POSSIBLE_PYTHON_LIBDIRS="/lib /lib64 /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64 ${PYTHON_STDLIBDIR} ${PYTHON_STDLIBDIR}/lib"
+	# sometimes Apple puts a symlink in ${PYTHONSTDLIBDIR}/lib, sometimes it doesn't
+	TMP=`echo "$PYTHON_STDLIBDIR" | sed -n s'|\(.*/lib\)/python'"${PYTHON_VERSION}"'|\1|p'`
+	if [ "$TMP" ]; then POSSIBLE_PYTHON_LIBDIRS="${POSSIBLE_PYTHON_LIBDIRS} ${TMP}"; fi
+	# Ubuntu is special, of course
+	if uname -a | grep -i 'ubuntu' > /dev/null; then
+		POSSIBLE_PYTHON_LIBDIRS="${POSSIBLE_PYTHON_LIBDIRS} /usr/lib/$(uname -i)-linux-gnu"
+	fi
+
+	for PYTHON_LIBDIR in $POSSIBLE_PYTHON_LIBDIRS; do
+		for PV in $PYTHON_VERSION $PYTHONVERSIONSIMPLE; do
+			#echo "  Looking for ${PYTHON_LIBDIR}/libpython${PV}${PYTHONLIBSUFFIX}.(a|so|dylib)"
+			if [ -d $PYTHON_LIBDIR ]; then
+				if [ -e ${PYTHON_LIBDIR}/libpython${PV}${PYTHONLIBSUFFIX}.a ]; then
+					PYTHON_LIBRARY=${PYTHON_LIBDIR}/libpython${PV}${PYTHONLIBSUFFIX}.a
+					break
+				elif [ -e ${PYTHON_LIBDIR}/libpython${PV}${PYTHONLIBSUFFIX}.so ];then
+					PYTHON_LIBRARY=${PYTHON_LIBDIR}/libpython${PV}${PYTHONLIBSUFFIX}.so
+					break
+				elif [ -e ${PYTHON_LIBDIR}/libpython${PV}${PYTHONLIBSUFFIX}.dylib ]; then
+					PYTHON_LIBRARY=${PYTHON_LIBDIR}/libpython${PV}${PYTHONLIBSUFFIX}.dylib
+					break
+				fi
+			fi
+		done
+	done
+	if [ -e "$PYTHON_LIBRARY" ]; then
+		echo " Found python library $PYTHON_LIBRARY"
+	else
+		echo " Unable to locate the python library"
+		return
+	fi
+
+	PYTHON_CFLAGS="-I${PYTHON_INCDIR}"
+	PYTHON_LDFLAGS="-L${PYTHON_LIBDIR} -l$(echo "$PYTHON_LIBRARY" | sed 's|.*lib\(python.*\)\.[a-z]*|\1|')"
+	PYTHON_FOUND=1
+}
+
+try_find_boost(){
+	PKG=boost
+	VAR_PREFIX=`echo $PKG | tr [:lower:] [:upper:]`
+	TMP_FOUND=`eval echo "$"${VAR_PREFIX}_FOUND`
+	if [ "$TMP_FOUND" ]; then return; fi
+	if [ "$PYTHON_FOUND" ]; then
+		PYV=`${PYTHON_EXE} -c 'import sys; print(str(sys.version_info.major)+str(sys.version_info.minor))'`
+		PYVM=`${PYTHON_EXE} -c 'import sys; print(sys.version_info.major)'`
+		echo "Looking for $PKG built for python ${PYV} in $GUESS_DIR..."
+	else
+		echo "Looking for $PKG in $GUESS_DIR..."
+	fi
+	
+ 	if [ "$#" -eq 1 ]; then
+ 		GUESS_DIR=$1
+ 		POSSIBLE_BOOST_LIBDIRS="${GUESS_DIR}/lib ${GUESS_DIR}/lib64 ${GUESS_DIR}/lib/x86_64-linux-gnu"
+		POSSIBLE_BOOST_INCDIRS="${GUESS_DIR}/include"
+	elif [ "$#" -eq 2 ]; then
+		GUESS_DIR="$1 and $2"
+		POSSIBLE_BOOST_LIBDIRS="$2"
+		POSSIBLE_BOOST_INCDIRS="$1"
+	else
+		echo "Wrong number of arguments to try_find_boost"
+		return
+ 	fi
+	if [ "$PYTHON_FOUND" ]; then
+		for PYV_SUFFIX in $PYV $PYVM ''; do
+			for BOOST_LIBDIR in $POSSIBLE_BOOST_LIBDIRS; do
+				if [ -d $BOOST_LIBDIR -a \( -e $BOOST_LIBDIR/libboost_python${PYV_SUFFIX}.a -o -e $BOOST_LIBDIR/libboost_python${PYV_SUFFIX}.so -o -e $BOOST_LIBDIR/libboost_python${PYV_SUFFIX}.dylib \) ]; then
+					if [ ! "$PYV_SUFFIX" ]; then
+						echo " Found boost_python with no python version tag; hoping it is compatible"
+					fi
+					BOOST_PYTHON_FOUND=1
+					BOOST_PYTHON_LDFLAGS="-lboost_python${PYV_SUFFIX}"
+					break
+				fi
+			done
+			if [ "$BOOST_PYTHON_FOUND" ]; then break; fi
+		done
+		if [ ! "$BOOST_PYTHON_FOUND" ]; then
+			echo " Unable to locate the boost_python library in $GUESS_DIR"
+		fi
+	fi
+	for BOOST_INCDIR in $POSSIBLE_BOOST_INCDIRS; do
+		if [ -d $BOOST_INCDIR -a -e $BOOST_INCDIR/boost/version.hpp ]; then
+			break
+		fi
+	done
+	if [ ! -d "$BOOST_INCDIR" -o ! -e "$BOOST_INCDIR/boost/version.hpp" ]; then
+		echo " Unable to locate boost/version.hpp in $GUESS_DIR"
+		return
+	fi
+	BOOST_CFLAGS="-I${BOOST_INCDIR}"
+	BOOST_LDFLAGS="-Wl,-rpath -Wl,${BOOST_LIBDIR} -L${BOOST_LIBDIR}"
+	BOOST_FOUND=1
+	echo " Found boost in $GUESS_DIR"
+	echo " Boost include directory is ${BOOST_INCDIR}"
+	if [ "$BOOST_LIBDIR" ]; then
+		echo " Boost library directory is ${BOOST_LIBDIR}"
+	fi
+}
+
+PYTHON_EXE="python"
+PYTHON_BINDINGS=true
+
+ensure_found(){
+	PKG=$1
+	VAR_PREFIX=`echo $PKG | tr [:lower:] [:upper:]`
+	TMP_FOUND=`eval echo "$"${VAR_PREFIX}_FOUND`
+	if [ "$TMP_FOUND" ]; then return; fi
+	#not found
+	echo "Error: $PKG not installed or not registered with pkg-config" 1>&2
+	lowername=`echo $PKG | tr [A-Z] [a-z]`
+	echo "Please specify location using the --with-"$lowername" flag" 1>&2
+	exit 1
+}
+
+PREFIX=/usr/local
+
+VERSION_NUM=100000
+VERSION=`echo $VERSION_NUM | awk '{
+	major = int($1/100000);
+	minor = int($1/100)%1000;
+	patch = $1%100;
+	print major"."minor"."patch;
+}'`
+
+# resolve the absolute path in which we want to configure, and also go there so
+# that the rest of the script can use relative paths
+ORIG_DIR=`pwd`
+NNF_DIR=`dirname $0`
+cd "$NNF_DIR"
+NNF_DIR=`pwd`
+
+OS_NAME=`uname -s`
+
+GUESS_CC=gcc
+GUESS_CXX=g++
+GUESS_AR=ar
+GUESS_LD=ld
+if [ "$OS_NAME" = Linux ]; then
+	DYN_SUFFIX=.so
+	DYN_OPT='-shared -Wl,-soname,$(DYN_LIB)'
+fi
+if [ "$OS_NAME" = Darwin ]; then
+	GUESS_CC=clang
+	GUESS_CXX=clang++
+	GUESS_LD=clang++
+	DYN_SUFFIX=.dylib
+	DYN_OPT='-dynamiclib -flat_namespace -undefined dynamic_lookup -multiply_defined suppress -compatibility_version $(VERSION) -current_version $(VERSION)'
+	INSTALLNAME='-Wl,-install_name,$(NF_DIR)/lib/libNewNuFlux.$(DYN_SUFFIX)'
+fi
+
+CC=${CC-$GUESS_CC}
+CXX=${CXX-$GUESS_CXX}
+AR=${AR-$GUESS_AR}
+LD=${LD-$GUESS_LD}
+
+HELP="Usage: ./config.sh [OPTION]... 
+
+Installation directories:
+  --prefix=PREFIX         install files in PREFIX
+                          [$PREFIX]
+
+By default, \`make install' will install all the files in
+\`$PREFIX/bin', \`$PREFIX/lib' etc.  You can specify
+an installation prefix other than \`$PREFIX' using \`--prefix',
+for instance \`--prefix=\$HOME'.
+
+The following options can be used to maunally specify the 
+locations of dependencies:
+  --with-boost=DIR               use the copy of Boost in DIR
+                                 assuming headers are in DIR/include
+                                 and libraries in DIR/lib
+  --with-boost-incdir=DIR        use the copy of Boost in DIR
+  --with-boost-libdir=DIR        use the copy of Boost in DIR
+  --with-hdf5=DIR                use the copy of HDF5 in DIR
+                                 assuming headers are in DIR/include
+                                 and libraries in DIR/lib
+  --with-hdf5-incdir=DIR         use the copy of HDF5 in DIR
+  --with-hdf5-libdir=DIR         use the copy of HDF5 in DIR
+  --with-photospline-config=EXE  use this photospline-config
+For the python bindings the following flags are used:
+  --with-python-bindings         enable python binding compilation
+  --without-python-bindings      disable python binding compilation
+  --python-bin=PYTHON_EXECUTABLE use this python executable
+                                 (default is 'python')
+  --python-module-dir=DIR        install python module to this directory, rather
+                                 than the default system location. The special 
+                                 value site.USER_SITE will be automatically
+                                 expanded using the python interpreter
+
+Some influential environment variables:
+CC          C compiler command
+CXX         C++ compiler command
+AR          Static linker command
+LD          Dynamic linker command
+" #`
+
+for var in "$@"
+do
+	if [ "$var" = "--help" -o "$var" = "-h" ]; then
+		echo "$HELP"
+		exit 0
+	fi
+
+	# PREFIX #
+	TMP=`echo "$var" | sed -n 's/^--prefix=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then PREFIX="$TMP"; continue; fi
+
+	# HDF5 #
+	TMP=`echo "$var" | sed -n 's/^--with-hdf5=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then
+		HDF5_INCDIR="${TMP}/include";
+		HDF5_LIBDIR="${TMP}/lib";
+	continue; fi
+
+	TMP=`echo "$var" | sed -n 's/^--with-hdf5-incdir=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then HDF5_INCDIR="$TMP"; continue; fi
+
+	TMP=`echo "$var" | sed -n 's/^--with-hdf5-libdir=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then HDF5_LIBDIR="$TMP"; continue; fi
+
+	# PHOTOSPLINE #
+	TMP=`echo "$var" | sed -n 's/^--with-photospline-config=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then
+		PHOTOSPLINE_CONFIG="${TMP}";
+	continue; fi
+
+	# BOOST #
+	TMP=`echo "$var" | sed -n 's/^--with-boost=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then
+		BOOST_INCDIR="${TMP}/include";
+		BOOST_LIBDIR="${TMP}/lib";
+	continue; fi
+
+	TMP=`echo "$var" | sed -n 's/^--with-boost-libdir=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then BOOST_LIBDIR="$TMP"; continue; fi
+
+	TMP=`echo "$var" | sed -n 's/^--with-boost-incdir=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then BOOST_INCDIR="$TMP"; continue; fi
+
+	# PYTHON #
+	TMP=`echo "$var" | sed -n 's/^--with-python-bindings/true/p'`
+	if [ "$TMP" ]; then PYTHON_BINDINGS=true; continue; fi
+
+	TMP=`echo "$var" | sed -n 's/^--without-python-bindings/true/p'`
+	if [ "$TMP" ]; then unset PYTHON_BINDINGS; continue; fi
+
+	TMP=`echo "$var" | sed -n 's/^--python-bin=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then PYTHON_EXE="${TMP}"; continue; fi
+	
+	TMP=`echo "$var" | sed -n 's/^--python-module-dir=\(.*\)$/\1/p'`
+	if [ "$TMP" ]; then USER_PYTHON_MODULE_DIR="${TMP}"; continue; fi
+
+	echo "config.sh: Unknown or malformed option '$var'" 1>&2
+	exit 1
+done
+
+if [ "$HDF5_INCDIR" -a "$HDF5_LIBDIR" ]; then
+	echo "Checking manually specified HDF5..."
+	if [ -d "$HDF5_INCDIR" \
+         -a -e "$HDF5_INCDIR/H5version.h" \
+         -a -d "$HDF5_LIBDIR" \
+         -a -e "$HDF5_LIBDIR/libhdf5.a" \
+         -a -e "$HDF5_LIBDIR/libhdf5_hl.a" ]; then
+		HDF5_FOUND=1
+		HDF5_CFLAGS="-I$HDF5_INCDIR"
+		HDF5_LDFLAGS="-L$HDF5_LIBDIR -lhdf5 -lhdf5_hl"
+	else
+		echo "Warning: manually specifed HDF5 not found; will attempt auto detection"
+	fi
+fi
+
+#Do not use this due to broken Ubuntu package
+#find_package hdf5 1.8
+find_hdf5
+find_package cfitsio
+
+try_find_photospline
+
+if [ $PYTHON_BINDINGS ]; then
+	try_find_python
+
+	if [ "$PYTHON_FOUND" != 1 ]; then
+		echo "*** Failed to find python; python bindings will not be built ***"
+		unset PYTHON_BINDINGS
+	else
+		if [ "$USER_PYTHON_MODULE_DIR" ]; then
+			if [ "$USER_PYTHON_MODULE_DIR" == "site.USER_SITE" ]; then
+				PYTHON_MODULEDIR=`${PYTHON_EXE} -c 'import site; print(site.USER_SITE)'`
+			else
+				PYTHON_MODULEDIR="$USER_PYTHON_MODULE_DIR"
+			fi
+		fi
+	fi
+fi
+
+if [ "$BOOST_INCDIR" -a "$BOOST_LIBDIR" ]; then
+  echo "Checking manually specified boost..."
+	try_find_boost "$BOOST_INCDIR" "$BOOST_LIBDIR"
+	if [ ! "$BOOST_FOUND" ]; then
+		echo "Warning: manually specifed boost not found; will attempt auto detection"
+	fi
+fi
+
+try_find_boost /usr
+try_find_boost /usr/local
+
+if [ -z $BOOST_LIBDIR -a  -z $BOOST_INCDIR ]; then
+  echo "Error: Specify BOOST library path using --with-boost-libdir and BOOST include path using --with-boost-incdir."
+  exit 1
+fi
+if [ -z $BOOST_LIBDIR ]; then
+  echo "Error: Specify BOOST library path using  --with-boost-libdir."
+  exit 1
+fi
+if [ -z $BOOST_INCDIR ]; then
+  echo "Error: Specify BOOST include path using  --with-boost-incdir."
+  exit 1
+fi
+
+ensure_found hdf5
+ensure_found photospline
+ensure_found boost
+
+if [ ! -d ./build/ ]; then
+    mkdir build;
+fi
+if [ ! -d ./lib/ ]; then
+    mkdir lib;
+fi
+
+# Resolve PREFIX absolutely
+OLDPWD=`pwd`
+cd "$PREFIX"
+PREFIX=`pwd`
+cd "$OLDPWD"
+
+echo "Generating pkg-config file..."
+
+# Somewhat evil: HDF5 does not register with pkg-config, which causes the latter
+# to error out because it cannot find all of our dependencies.
+# Solution: Since we found HDF5 (hopefully correctly), register it ourselves.
+echo "# WARNING: This configuration file was heutristically generated by NewNuFlux
+# and may not be complete or correct
+libdir=${HDF5_LIBDIR}
+includedir=${HDF5_INCDIR}" > lib/hdf5.pc
+echo '
+Name: HDF5
+Description: "A data model, library, and file format for storing and managing data."
+URL: https://www.hdfgroup.org/HDF5/' >> lib/hdf5.pc
+echo "Version: ${HDF5_VERSION}" >> lib/hdf5.pc
+echo "Cflags: ${HDF5_CFLAGS}
+Libs: ${HDF5_LDFLAGS}
+" >> lib/hdf5.pc
+
+echo "prefix=$PREFIX" > lib/newnuflux.pc
+echo '
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: NewNuFlux
+Description: A library for evaluating tabulated neutrino fluxes
+' >> lib/newnuflux.pc
+echo "Version: $VERSION" >> lib/newnuflux.pc
+echo 'Requires: hdf5 >= 1.8
+Libs: -L${libdir} -lNewNuFlux '$BOOST_LDFLAGS $PHOTOSPLINE_LDFLAGS'
+Cflags: -I${includedir} '$BOOST_CFLAGS $PHOTOSPLINE_CFLAGS'
+' >> lib/newnuflux.pc
+
+echo "Generating makefile..."
+echo "# Directories
+LIBDIR:=lib
+INCDIR:=include
+SQINCDIR:=include/SQuIDS
+SRCDIR:=src
+
+# Compiler
+CC:=$CC
+CXX:=$CXX
+AR:=$AR
+LD:=$LD
+
+BOOST_CFLAGS=$BOOST_CFLAGS
+BOOST_LDFLAGS=$BOOST_LDFLAGS
+
+HDF5_CFLAGS=$HDF5_CFLAGS
+HDF5_LDFLAGS=$HDF5_LDFLAGS
+
+PHOTOSPLINE_CFLAGS=$PHOTOSPLINE_CFLAGS
+PHOTOSPLINE_LDFLAGS=$PHOTOSPLINE_LDFLAGS
+
+CFITSIO_CFLAGS=$CFITSIO_CFLAGS
+CFITSIO_LDFLAGS=$CFITSIO_LDFLAGS
+
+CFLAGS:=$CFLAGS "'-O3 -fPIC -I$(INCDIR) $(BOOST_CFLAGS) $(HDF5_CFLAGS) $(PHOTOSPLINE_CFLAGS) $(CFITSIO_CFLAGS)'"
+CXXFLAGS:=$CXXFLAGS "'$(CFLAGS)'"
+LDFLAGS:=$LDFLAGS "'-L$(LIBDIR) $(BOOST_LDFLAGS) $(HDF5_LDFLAGS) $(PHOTOSPLINE_LDFLAGS) $(CFITSIO_LDFLAGS)'"
+
+DYN_SUFFIX:=$DYN_SUFFIX
+DYN_OPT=$DYN_OPT
+INSTALLNAME=$INSTALLNAME
+
+PREFIX=$PREFIX
+"> build/config.mk
+
+if [ $PYTHON_BINDINGS ]; then
+	echo "Configuring Python bindings..."
+
+	echo 'PYMODULE=NewNuFlux.so' >> build/config.mk
+	echo 'PYBINDINGS=$(LIBDIR)/$(PYMODULE)' >> build/config.mk
+	echo "
+PYCXXFLAGS="'$(CXXFLAGS)'" ${PYTHON_CFLAGS}
+PYLDFLAGS=-lNewNuFlux "'$(LDFLAGS)'" ${PYTHON_LDFLAGS} ${BOOST_PYTHON_LDFLAGS}
+PYTHON_INSTALL_DIR=$PYTHON_INSTALL_DIR
+" >> build/config.mk
+
+fi
+
+echo "Done."
+echo "To build library, run the following: make"
